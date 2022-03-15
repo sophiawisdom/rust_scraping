@@ -1,0 +1,5 @@
+/target
+results
+WSL2-Linux-Kernel
+flamegraph.svg
+perf.data
