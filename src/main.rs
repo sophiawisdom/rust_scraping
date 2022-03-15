@@ -56,9 +56,9 @@ async fn fetch_and_parse(url: String, client: &ClientWithMiddleware) -> scraper:
 #[tokio::main]
 async fn main() {
     let reqwest_client = match reqwest::ClientBuilder::new()
+    // Copied the user_agent from my browser which seems to convince it to let us through
     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36")
     .gzip(true)
-    // .http2_prior_knowledge()
     .build() {
         Ok(client) => client,
         Err(error) => panic!("Couldn't make client: {:?}", error)
@@ -68,12 +68,11 @@ async fn main() {
     let literotica_client = ClientBuilder::new(reqwest_client)
     .with(RetryTransientMiddleware::new_with_policy(retry_policy))
     .build();
-
     
-    // 1-page
-    // let category_links: [String; 3] = ["https://website.com/1".to_string(), "https://website.com/2".to_string(), "https://website.com/3".to_string()];
     let category_links = vec!["https://www.literotica.com/c/anal-sex-stories".to_string(), "https://www.literotica.com/c/bdsm-stories".to_string(), "https://www.literotica.com/c/celebrity-stories".to_string(), "https://www.literotica.com/c/chain-stories".to_string(), "https://www.literotica.com/c/erotic-couplings".to_string(), "https://www.literotica.com/c/erotic-horror".to_string(), "https://www.literotica.com/c/exhibitionist-voyeur".to_string(), "https://www.literotica.com/c/fetish-stories".to_string(), "https://www.literotica.com/c/first-time-sex-stories".to_string(), "https://www.literotica.com/c/gay-sex-stories".to_string(), "https://www.literotica.com/c/group-sex-stories".to_string(), "https://www.literotica.com/c/adult-how-to".to_string(), "https://www.literotica.com/c/adult-humor".to_string(), "https://www.literotica.com/c/taboo-sex-stories".to_string(), "https://www.literotica.com/c/interracial-erotic-stories".to_string(), "https://www.literotica.com/c/lesbian-sex-stories".to_string(), "https://www.literotica.com/c/erotic-letters".to_string(), "https://www.literotica.com/c/loving-wives".to_string(), "https://www.literotica.com/c/mature-sex".to_string(), "https://www.literotica.com/c/mind-control".to_string(), "https://www.literotica.com/c/non-consent-stories".to_string(), "https://www.literotica.com/c/non-human-stories".to_string(), "https://www.literotica.com/c/erotic-novels".to_string(), "https://www.literotica.com/c/reviews-and-essays".to_string(), "https://www.literotica.com/c/adult-romance".to_string(), "https://www.literotica.com/c/science-fiction-fantasy".to_string(), "https://www.literotica.com/c/audio-sex-stories".to_string(), "https://www.literotica.com/c/masturbation-stories".to_string(), "https://www.literotica.com/c/transsexuals-crossdressers".to_string()];
 
+    // We have a static list of categories we want to fetch. For every category we then figure out
+    // how many pages are in that category's listing (e.g. https://www.literotica.com/c/anal-sex-stories/18-page, 19-page, etc.)
     println!("1) Fetching category pages: ");
     let cat_bar = ProgressBar::new(category_links.len() as u64);
     let cat_page_list =
@@ -81,13 +80,9 @@ async fn main() {
         .map(|url| {
             let client = &literotica_client;
             async move {
-                println!("Beginning fetching url {}", url);
                 let burl = &url;
                 match client.get(burl).send().await {
-                    Ok(resp) => {
-                        println!("Completed fetching url {}", burl);
-                        resp.bytes().await
-                    },
+                    Ok(resp) => resp.bytes().await,
                     Err(e) => panic!("getting data failed")
                 }
             }
@@ -135,9 +130,9 @@ async fn main() {
         })
         .flatten_unordered(None)
         .collect::<Vec<CatInfo>>().await;
-    
     cat_bar.finish();
 
+    // We have a list of all the category pages, which list stories, so we scrape every category page and get a list of all stories.
     println!("Found {} story listing pages", cat_page_list.len());
     let story_list_bar = ProgressBar::new(cat_page_list.len() as u64);
     println!("2) Fetching list of stories from category pages: ");
@@ -164,13 +159,14 @@ async fn main() {
         .await;    
     story_list_bar.finish();
 
+    // Scraping like this is somewhat unreliable and the current pipeline I'm using is very vulnerable to errors. Here we
+    // implement a mechanism to scrape the site again, ignoring all the stories we've already scraped.
     let already_existing = std::fs::File::open("/home/sophiawisdom/rust_scraping/results/metadata/little_bit.json").unwrap();
     let already_grabbed_stories: Vec<StoryInfo> = serde_json::from_reader(already_existing).unwrap();
     let mut already_have_metadata = std::collections::HashSet::new();
     for story in &already_grabbed_stories {
         already_have_metadata.insert(story.storyName.clone());
     }
-
     let mut ungrabbed_stories = vec![];
     for story in &story_list {
         if !already_have_metadata.contains(story) {
@@ -178,10 +174,13 @@ async fn main() {
         }
     }
 
+    // Set up a fancy progress bar, because for a full scrape this can easily take 1-2h so we want good info on what's happening.
     println!("Fetching stories! There used to be {} but there are now {}", &story_list.len(), ungrabbed_stories.len());
     let story_parse_bar = ProgressBar::new(ungrabbed_stories.len() as u64);
     story_parse_bar.set_style(indicatif::ProgressStyle::default_bar()
     .template("parsing {msg}\n{pos}/{len} @ {per_sec} ETA: {elapsed_precise}/{duration_precise}\n{wide_bar}"));
+    
+    // We have a list of all the stories we want to scrape, and then we scrape them all and write them.
     let mut stories = already_grabbed_stories.clone();
     stream::iter(ungrabbed_stories)
     .map(|page| {
