@@ -1,5 +1,5 @@
 #![feature(pattern)]
-use std::{str::pattern::Pattern, io::Write};
+use std::{io::Write, time::SystemTime};
 use serde;
 use reqwest;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
@@ -33,11 +33,12 @@ struct StoryInfo {
     // comments are more complicated; we should use https://classic.literotica.com/stories/storyfeedbackboard.php?id=343471&pagehint=6 or the like to get these.
 }
 
-const MAX_CONCURRENT_REQUESTS: usize = 500;
+const MAX_CONCURRENT_REQUESTS: usize = 1000;
 
 mod parsers;
 
-async fn fetch_and_parse(url: String, client: &ClientWithMiddleware) -> scraper::Html {
+async fn fetch_and_parse(url: String, client: &ClientWithMiddleware) -> (scraper::Html, u128, u128) {
+    let before_request = std::time::SystemTime::now();
     let resp = match client.get(&url).send().await {
         Ok(resp) => {
             match resp.bytes().await {
@@ -50,7 +51,10 @@ async fn fetch_and_parse(url: String, client: &ClientWithMiddleware) -> scraper:
             panic!("getting data failed")
         }
     };
-    Html::parse_document(&resp)
+    let after_request = std::time::SystemTime::now();
+    let parsed = Html::parse_document(&resp);
+    let after_parse = std::time::SystemTime::now();
+    return (parsed, after_request.duration_since(before_request).unwrap().as_micros(), after_parse.duration_since(after_request).unwrap().as_micros());
 }
 
 #[tokio::main]
@@ -87,7 +91,7 @@ async fn main() {
                 }
             }
         })
-        .buffer_unordered(500)
+        .buffer_unordered(MAX_CONCURRENT_REQUESTS)
         .then(|resp| async {
             let bar = cat_bar.clone();
             match tokio::spawn(async move {
@@ -128,40 +132,58 @@ async fn main() {
                 Err(e) => panic!("got error with tokio spawn")
             }
         })
-        .flatten_unordered(None)
+        .flatten_unordered(MAX_CONCURRENT_REQUESTS)
         .collect::<Vec<CatInfo>>().await;
     cat_bar.finish();
+
+
 
     // We have a list of all the category pages, which list stories, so we scrape every category page and get a list of all stories.
     println!("Found {} story listing pages", cat_page_list.len());
     let story_list_bar = ProgressBar::new(cat_page_list.len() as u64);
     println!("2) Fetching list of stories from category pages: ");
-    let mut story_list = stream::iter(cat_page_list)
+    let total_fetch_time = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let total_parse_time = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let story_list = stream::iter(&cat_page_list)
         .map(|page| {
             let client = literotica_client.clone();
             let category_url = format!("https://www.literotica.com/c/{}/{}-page", page.category, page.page.to_string());
+            let fetch_clone = std::sync::Arc::clone(&total_fetch_time);
+            let parse_clone = std::sync::Arc::clone(&total_parse_time);
             async {
                 match tokio::spawn(async move {
-                    let parsed = fetch_and_parse(category_url, &client).await;
+                    let (parsed, fetch_time, parse_time) = fetch_and_parse(category_url, &client).await;
+                    fetch_clone.fetch_add(fetch_time as u64, std::sync::atomic::Ordering::AcqRel);
+                    parse_clone.fetch_add(parse_time as u64, std::sync::atomic::Ordering::AcqRel);
                     stream::iter(parsers::parse_story_listing(parsed))
                 }).await {
                     Ok(resp) => {
                         story_list_bar.inc(1);
                         resp
                     },
-                    Err(e) => panic!("tokio cat page spawn failed")
+                    Err(e) => panic!("tokio cat page spawn failed {}", e)
                 }
             }
         })
-        .buffer_unordered(MAX_CONCURRENT_REQUESTS)
-        .flatten_unordered(MAX_CONCURRENT_REQUESTS)
+        .buffer_unordered(20)
+        .flatten_unordered(20)
         .collect::<Vec<String>>()
         .await;    
     story_list_bar.finish();
 
+    let fetch_val = total_fetch_time.load(std::sync::atomic::Ordering::Acquire);
+    let parse_val = total_parse_time.load(std::sync::atomic::Ordering::Acquire);
+
+    let average_fetch_time: f64 = (fetch_val as f64)/(cat_page_list.len() as f64);
+    let average_parse_time: f64 = (parse_val as f64)/(cat_page_list.len() as f64);
+    println!("Fetch time is {}, parse time is {}", average_fetch_time/1_000_000.0, average_parse_time/1_000_000.0);
+
     // Scraping like this is somewhat unreliable and the current pipeline I'm using is very vulnerable to errors. Here we
     // implement a mechanism to scrape the site again, ignoring all the stories we've already scraped.
-    let already_existing = std::fs::File::open("/home/sophiawisdom/rust_scraping/results/metadata/little_bit.json").unwrap();
+    let already_existing = match std::fs::File::open("/home/sophiawisdom/rust_scraping/results/metadata/little_bit.json") {
+        Ok(file) => file,
+        Err(e) => panic!("Got error while trying to open little_bit.json {}", e)
+    };
     let already_grabbed_stories: Vec<StoryInfo> = serde_json::from_reader(already_existing).unwrap();
     let mut already_have_metadata = std::collections::HashSet::new();
     for story in &already_grabbed_stories {
@@ -173,6 +195,8 @@ async fn main() {
             ungrabbed_stories.push(story);
         }
     }
+
+    // let files = std::fs::read_dir("/home/sophiawisdom/rust_scraping/results/stories").unwrap();
 
     // Set up a fancy progress bar, because for a full scrape this can easily take 1-2h so we want good info on what's happening.
     println!("Fetching stories! There used to be {} but there are now {}", &story_list.len(), ungrabbed_stories.len());
@@ -194,7 +218,7 @@ async fn main() {
                 let mut story_text = String::new();
                 let first_page_info;
                 {
-                    let first_page = fetch_and_parse(page_url, &client).await;
+                    let (first_page, _, _) = fetch_and_parse(page_url, &client).await;
                     first_page_info = parsers::parse_first_story_page(&first_page);
                     cur_url = match first_page_info.next_url.as_str() {
                         "" => None,
@@ -211,34 +235,30 @@ async fn main() {
 
                 let next_page_button = Selector::parse("a[title=\"Next Page\"]").unwrap();
                 let filename = format!("/home/sophiawisdom/rust_scraping/results/stories/{gage}.txt");
-                let path_exists = std::path::Path::exists(std::path::Path::new(&filename));
-                if !path_exists {
-                    loop {
-                        cur_url = match cur_url {
-                            Some(url) => {
-                                let fetched_page = fetch_and_parse(url.to_string(), &client).await;
+                loop {
+                    cur_url = match cur_url {
+                        Some(url) => {
+                            let (fetched_page, _, _) = fetch_and_parse(url.to_string(), &client).await;
 
-                                let text_selector = Selector::parse("div.panel.article p").unwrap();
-                                let mut stuff = vec![];
-                                for el in fetched_page.select(&text_selector) {
-                                    stuff.push(el.text().collect::<Vec<_>>().join(""));
-                                }
-                                story_text.push_str(&stuff.join("\n"));
+                            let text_selector = Selector::parse("div.panel.article p").unwrap();
+                            let mut stuff = vec![];
+                            for el in fetched_page.select(&text_selector) {
+                                stuff.push(el.text().collect::<Vec<_>>().join(""));
+                            }
+                            story_text.push_str(&stuff.join("\n"));
 
-                                match fetched_page.select(&next_page_button).next() {
-                                    Some(el) => {
-                                        Some(format!("https://www.literotica.com/s/{}", el.value().attr("href").unwrap().to_string()))
-                                    },
-                                    None => None,
-                                }
-                            },
-                            None => break
-                        };
-                    }
-                    println!("writing file");
-                    let mut story_file = std::fs::File::create(filename).unwrap();
-                    story_file.write_all(story_text.as_bytes()).unwrap();
+                            match fetched_page.select(&next_page_button).next() {
+                                Some(el) => {
+                                    Some(format!("https://www.literotica.com/s/{}", el.value().attr("href").unwrap().to_string()))
+                                },
+                                None => None,
+                            }
+                        },
+                        None => break
+                    };
                 }
+                let mut story_file = std::fs::File::create(filename).unwrap();
+                story_file.write_all(story_text.as_bytes()).unwrap();
 
                 let time_since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
                 stream::iter(vec![StoryInfo {
@@ -274,6 +294,9 @@ async fn main() {
     .map(|story| {
         stories.push(story);
         if stories.len() % 5000 == 0 {
+            // When we do this we pause the whole application for gradually-increasing amounts of time as we get more stories.
+            // This isn't ideal on a per-se efficiency basis, but it's important for us to double-scrape as few times as we can,
+            // so it's worthwhile for us to do this.
             println!("writing {} files", &stories.len());
             let file = std::fs::File::create("/home/sophiawisdom/rust_scraping/results/metadata/little_bit.json").unwrap();
             serde_json::to_writer_pretty(file, &stories).unwrap();
